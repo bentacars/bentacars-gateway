@@ -1,8 +1,4 @@
 // /api/chat.js
-// Fast, deterministic qualifier (instant replies).
-// Uses OpenAI only as a fallback when still ambiguous.
-// ManyChat: map $.ai_reply -> ai_reply
-
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ ai_reply: 'Method not allowed' });
@@ -20,126 +16,134 @@ export default async function handler(req, res) {
       ai_location = ''
     } = req.body || {};
 
-    // --- Normalize incoming text
-    const raw = String(message || '').trim();
-    const msg = raw.toLowerCase();
-
-    // --- Light model → body-type inference
+    // --- Light model → body-type inference ---
     const modelToBody = {
-      vios: 'sedan', wigo: 'hatchback', raize: 'crossover',
-      innova: 'mpv', avanza: 'mpv', veloz: 'mpv', fortuner: 'suv', hilux: 'pickup',
+      vios: 'sedan', wigo: 'hatchback', raize: 'crossover', innova: 'mpv',
+      avanza: 'mpv', veloz: 'mpv', fortuner: 'suv', hilux: 'pickup',
       city: 'sedan', civic: 'sedan', brv: '7-seater suv',
       almera: 'sedan', xpander: 'mpv', mirage: 'hatchback',
       territory: 'suv'
     };
-    const normModel = String(ai_model || '').toLowerCase().replace(/\s+/g, '');
+    const normalizedModel = String(ai_model || '').toLowerCase().replace(/\s+/g, '');
     let inferredBody = '';
-    for (const k of Object.keys(modelToBody)) {
-      if (normModel.includes(k) || msg.includes(k)) {
-        inferredBody = modelToBody[k];
+    for (const key of Object.keys(modelToBody)) {
+      if (normalizedModel.includes(key)) {
+        inferredBody = modelToBody[key];
         break;
       }
     }
 
-    // --- Heuristics from the last user message
-    const paymentFromMsg =
-      /cash\b/.test(msg) ? 'cash' :
-      /(finance|loan|installment|hulugan|monthly)/.test(msg) ? 'financing' :
-      '';
-
-    // extract money-like number (₱, k, etc.)
-    const moneyMatch = msg.match(/(?:₱|\bphp\s*)?([\d,.]+)\s*(k|thou|thousand)?/i);
-    let moneyValue = '';
-    if (moneyMatch) {
-      const base = parseFloat((moneyMatch[1] || '').replace(/,/g, ''));
-      if (!isNaN(base)) {
-        moneyValue = moneyMatch[2] ? String(Math.round(base * 1000)) : String(Math.round(base));
-      }
-    }
-
-    // timeline inference
-    let timelineFromMsg = '';
-    if (/(today|tonight|ngayon)/.test(msg)) timelineFromMsg = 'today';
-    else if (/(this week|within the week|week)/.test(msg)) timelineFromMsg = 'this week';
-    else if (/(next week)/.test(msg)) timelineFromMsg = 'next week';
-    else if (/(this month|within the month)/.test(msg)) timelineFromMsg = 'this month';
-    else if (/(next month)/.test(msg)) timelineFromMsg = 'next month';
-
-    // location – very light (we keep whatever user already provided)
-    const locationFromMsg = ''; // optional: try to parse cities/barangays if you want later
-
-    // --- Known fields after merging heuristics
+    // --- What we know / still missing ---
     const known = {
-      model_or_body:
-        (ai_model && ai_model.trim()) ||
-        inferredBody ||
-        '',
-
-      payment_mode: (ai_payment_mode || paymentFromMsg || '').toLowerCase(),
-
-      budget_or_dp: (ai_budget || moneyValue || '').toString(),
-
-      timeline: (ai_timeline || timelineFromMsg || '').toString(),
-
-      location: (ai_location || locationFromMsg || '').toString()
+      model_or_body: (ai_model && ai_model.trim()) || inferredBody, // model text or inferred body
+      payment_mode : (ai_payment_mode || '').toLowerCase(),        // 'cash' or 'financing'
+      budget_or_dp : String(ai_budget || '').trim(),               // cash budget OR DP on-hand
+      location     : String(ai_location || '').trim(),
+      timeline     : String(ai_timeline || '').trim()
     };
 
-    // Greeting fast-path (instant, no OpenAI)
-    if (/^(hi|hello|hey|yo|good\s*(am|pm|day)|hi po|hello po)\b/.test(msg)) {
-      return res.status(200).json({
-        ai_reply: `Hi ${name || ''}! 👋 Anong model ang tinitingnan mo? 
-Kung wala pa, 5-seater (sedan/hatch/crossover) ba or 7-seater+ (MPV/SUV/van)? Pwede rin pickup o pang-negosyo.`
-          .replace(/\s+/g, ' ')
-      });
-    }
+    const missing = [];
+    if (!known.model_or_body) missing.push('model_or_body');
+    if (!known.payment_mode)  missing.push('payment_mode');
+    if (!known.budget_or_dp)  missing.push('budget_or_dp');
+    if (!known.location)      missing.push('location');
+    if (!known.timeline)      missing.push('timeline');
 
-    // Decide next missing info (our agreed order)
-    const missingOrder = [];
-    if (!known.model_or_body) missingOrder.push('model_or_body');
-    if (!known.payment_mode)  missingOrder.push('payment_mode');
-    if (!known.budget_or_dp)  missingOrder.push('budget_or_dp');
-    if (!known.location)      missingOrder.push('location');
-    if (!known.timeline)      missingOrder.push('timeline');
+    // --- Deterministic, one-question-at-a-time logic (no LLM for this) ---
+    if (missing.length) {
+      const first = missing[0];
+      let reply = '';
 
-    // Ask ONE concise question depending on the next missing item
-    if (missingOrder.length) {
-      const next = missingOrder[0];
+      switch (first) {
+        case 'model_or_body': {
+          // If user typed something like “vios”, we already inferred. Otherwise ask this:
+          reply = `Gotcha! Para masakto, 5-seater (sedan/hatch/crossover) ba o 7-seater+ (MPV/SUV/van)? Pwede rin pickup o pang-negosyo.`;
+          break;
+        }
 
-      let prompt = '';
-      if (next === 'model_or_body') {
-        prompt =
-          `Got it! Anong model ang target mo? ` +
-          `Kung undecided pa, 5-seater (sedan/hatch/crossover) ba or 7-seater+ (MPV/SUV/van)? ` +
-          `Pwede rin pickup o pang-negosyo.`;
-      } else if (next === 'payment_mode') {
-        prompt = `Sige. Payment mo ba ay **cash** o **financing**?`;
-      } else if (next === 'budget_or_dp') {
-        prompt = known.payment_mode === 'cash'
-          ? `Mga magkano ang cash budget mo?`
-          : `Magkano ang on-hand na downpayment mo (approx ok)?`;
-      } else if (next === 'location') {
-        prompt = `Saan area ka located para makahanap tayo ng malapit sa’yo?`;
-      } else if (next === 'timeline') {
-        prompt = `Kung may ma-suggest akong swak today, makakapag-view ka ba **this week**?`;
+        case 'payment_mode': {
+          // Small nudge if message hints “installment/cash”
+          const m = message.toLowerCase();
+          const hinted =
+            m.includes('install') || m.includes('hulug') ? 'Mukhang financing ang gusto mo—tama ba?' :
+            m.includes('cash') ? 'Mukhang cash ang gusto mo—tama ba?' : '';
+          reply = hinted || `Cash o financing po ang plan natin?`;
+          break;
+        }
+
+        case 'budget_or_dp': {
+          if (known.payment_mode === 'cash') {
+            reply = `Sige! Mga magkano cash budget mo? Ballpark ok lang.`;
+          } else {
+            reply = `Magkano ang on-hand na downpayment mo ngayon? Ballpark ok lang.`;
+          }
+          break;
+        }
+
+        case 'location': {
+          reply = `Saan area ka para ma-match ko sa malapit sa’yo? (Hal. QC, Makati, Cebu, Davao)`;
+          break;
+        }
+
+        case 'timeline': {
+          reply = `Kung may ma-suggest akong swak today, makakapag-view ka ba this week?`;
+          break;
+        }
       }
 
-      return res.status(200).json({ ai_reply: prompt });
+      return res.status(200).json({ ai_reply: reply });
     }
 
-    // If we reach here, kompleto na ang key qualifiers → acknowledge (no unit list yet)
-    const doneMsg =
-      `Thanks ${name || ''}! Parang kumpleto na tayo. ` +
-      `Iche-check ko ngayon ang best **2 options** na bagay sa'yo.`;
-    return res.status(200).json({ ai_reply: doneMsg });
+    // --- All qualifiers present → (optional) call OpenAI just to keep tone natural ---
+    const system = `
+Ikaw ay sales assistant ng BentaCars. Taglish, natural, human. 
+Huwag gumamit ng salitang "segment". Maikli at friendly.
+Ang customer ay kumpleto na ang key details, kaya mag-confirm ka lang and say:
+"Thanks <Name>! I-check ko ngayon ang **best 2 options** na bagay sa’yo."
+Walang bullet list ng units dito; confirmation lang. Plain text output.
+`.trim();
 
-    // --- Optional: If you still want to keep OpenAI as fallback when ambiguous,
-    // move the return above into an `else` and keep the call below.
-    // For now we short-circuit to keep replies instant.
+    const userMsg = `
+Customer: ${name || 'Customer'} (${user})
+Known:
+- Model/Body: ${known.model_or_body}
+- Payment mode: ${known.payment_mode}
+- Budget/DP: ${known.budget_or_dp}
+- Location: ${known.location}
+- Timeline: ${known.timeline}
+`.trim();
+
+    let aiText = '';
+    try {
+      const completion = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o-mini',
+          temperature: 0.3,
+          messages: [
+            { role: 'system', content: system },
+            { role: 'user', content: userMsg }
+          ]
+        })
+      });
+      const data = await completion.json();
+      aiText =
+        data?.choices?.[0]?.message?.content?.trim() ||
+        `Thanks ${name || ''}! I-check ko ngayon ang best 2 options na bagay sa’yo.`;
+    } catch {
+      aiText = `Thanks ${name || ''}! I-check ko ngayon ang best 2 options na bagay sa’yo.`;
+    }
+
+    return res.status(200).json({ ai_reply: aiText });
 
   } catch (err) {
     console.error(err);
     return res.status(500).json({
-      ai_reply: 'Oops, nagka-issue saglit. Paki-type ulit po, aayusin ko agad.'
+      ai_reply: 'Oops, nagka-issue saglit. Paki-type ulit po, aayusin ko kaagad.'
     });
   }
 }
