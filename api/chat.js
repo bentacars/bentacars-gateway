@@ -1,83 +1,68 @@
-// api/chat.js
+// /api/chat.js (Node/Next.js API Route)
 export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method Not Allowed" });
-  }
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   try {
-    const { message = "", user = "", name = "" } = req.body || {};
+    const { message, user, name } = req.body || {};
+    if (!message || !user) {
+      return res.status(400).json({ error: 'Missing message or user' });
+    }
 
-    // 1) Fetch inventory feed from your Apps Script
-    const SHEETS_API_URL = process.env.SHEETS_API_URL;
-    const r = await fetch(SHEETS_API_URL);
-    if (!r.ok) throw new Error(`Sheets API error: ${r.status}`);
-    const data = await r.json();
+    // Simple in-memory state for demo (stateless hosting resets this).
+    // For production, store per-user state in a DB (e.g., Supabase/Firestore).
+    // We'll infer missing fields every turn and ask the next best question.
+    const system = `
+You are BentaCars' sales assistant. Goal: qualify first, then recommend up to 2 best-matching units.
+Ask ONE concise question at a time in friendly Filipino/Taglish.
+Required qualifying info before suggesting cars:
+- desired vehicle type/segment (e.g., sedan, SUV, MPV) or specific model
+- budget range (PHP)
+- payment mode (cash or financing; if financing, ask ballpark DP or monthly)
+- timeline (when to buy)
+- location (optional but helpful)
 
-    // Expecting: data.rows = array of units (adjust if your shape differs)
-    const rows = Array.isArray(data.rows) ? data.rows : (data.data || data) || [];
-    // Simple filter stub (you can improve later using the "message" text):
-    // prioritize price_status === "Priority", then take top 3
-    const prioritized = rows
-      .filter(u => (u?.price_status || "").toLowerCase().includes("priority"))
-      .concat(rows.filter(u => !(u?.price_status || "").toLowerCase().includes("priority")));
+Rules:
+- If info is incomplete, DO NOT suggest cars yet. Ask the next best question.
+- Be brief and helpful. Example style: "Sige! Ano pong budget range natin?".
+- When info seems complete, respond with a short confirmation + say you'll check best options.
+Return only plain text that I can show the customer. No JSON, no code fences.
+`;
 
-    const top = prioritized.slice(0, 3);
+    // Build a compact chat for OpenAI
+    const userMsg = `${name ? name + ': ' : ''}${message}`.trim();
 
-    const toTitle = (u) => {
-      const yr = u?.year ? `${u.year}` : "";
-      const brand = u?.brand || "";
-      const model = u?.model || "";
-      const variant = u?.variant || "";
-      return [yr, brand, model, variant].filter(Boolean).join(" ");
-    };
-
-    const toDetails = (u) => {
-      const price = u?.srp ? `₱${Number(u.srp).toLocaleString("en-PH")}` : "Price upon viewing";
-      const km = u?.mileage ? `${u.mileage} km` : "—";
-      const trans = u?.transmission || "—";
-      const city = u?.city || u?.ncr_zone || u?.province || "—";
-      return `${price} • ${km} • ${trans} • ${city}`;
-    };
-
-    const toImage = (u) => {
-      // Prefer image_1; fallback to any image field present
-      const keys = Object.keys(u || {}).filter(k => k.startsWith("image_"));
-      return u?.image_1 || (keys.length ? u[keys[0]] : null);
-    };
-
-    const formatted_list = top.map((u, i) => {
-      return `${i + 1}) ${toEmoji(i)} ${toTitle(u)} • ${toDetails(u)}`;
+    // Call OpenAI Chat Completions (compatible endpoint)
+    const completion = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: userMsg }
+        ],
+        temperature: 0.3
+      })
     });
 
-    const images = top.map(toImage).filter(Boolean);
+    const data = await completion.json();
+    const aiText =
+      data?.choices?.[0]?.message?.content?.trim() ||
+      'Sige po, ano pong budget range natin para makahanap ako ng best na unit?';
 
-    const formatted_message = formatted_list.length
-      ? `✅ May ${top.length} tayong swak na options para sa’yo, ${name || "buyer"}:\n\n` +
-        formatted_list.join("\n") +
-        `\n\nGusto mo bang *schedule viewing* o *apply for financing*? Sabihin mo lang: "schedule" o "apply".`
-      : `Pasensya na, wala pang exact match based sa hinanap mo.\n` +
-        `Pwede mong i-send ang city, budget, transmission, at body type (hal: "QC 600k AT sedan") para makapag-match tayo agad.`;
-
+    // For now we only send back ai_reply.
+    // (Later, once you qualify fully, you can have your backend attach unit suggestions too.)
     return res.status(200).json({
-      success: true,
-      total_units: top.length,
-      formatted_list,
-      formatted_message,
-      images
+      ai_reply: aiText
     });
+
   } catch (err) {
     console.error(err);
-    return res.status(200).json({
-      success: false,
-      total_units: 0,
-      formatted_list: [],
-      formatted_message:
-        "Nagka-issue sa pagkuha ng units ngayon. Paki-try ulit in a bit o ibigay mo muna ang city, budget, at transmission para ma-priority ka.",
-      images: []
+    return res.status(500).json({
+      ai_reply: 'Pasensya na po, nagka-issue saglit. Paki-type ulit po ang mensahe.'
     });
   }
-}
-
-function toEmoji(i) {
-  return ["🚗", "🚙", "🚘"][i] || "🚗";
 }
