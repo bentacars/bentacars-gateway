@@ -1,178 +1,221 @@
 // /api/chat.js
-// Stateless API that guides a car-buying qualification in Taglish.
-// It uses "variable check" from fields you pass in the request body
-// so the bot asks ONLY what's still missing, one short question at a time.
+// Node 22+ (your package.json already set to "node": "22.x")
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
-    return res.status(405).json({ ai_reply: 'Method not allowed' });
+    return res.status(405).json({ ai_reply: 'Method not allowed.' });
   }
 
   try {
+    const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+    const MANYCHAT_API_KEY = process.env.MANYCHAT_API_KEY;
+
+    if (!OPENAI_API_KEY) {
+      return res.status(500).json({ ai_reply: 'Missing OPENAI_API_KEY on the server.' });
+    }
+    if (!MANYCHAT_API_KEY) {
+      // We can still respond, just won’t persist fields.
+      console.warn('⚠️ MANYCHAT_API_KEY is missing — fields will not be updated.');
+    }
+
     const {
-      message,          // user's latest text (required)
-      user,             // contact id (required)
-      name,             // first name (optional)
-      // "Memory" coming from ManyChat User Fields (all optional)
-      ai_model,
+      message,        // user's last text
+      user,           // ManyChat Contact Id (subscriber_id)
+      name,           // First Name
+      ai_model,       // current state from ManyChat (optional)
       ai_budget,
-      ai_payment_mode,  // "cash" or "financing" ideally
-      ai_timeline,      // when to buy
+      ai_payment_mode,
+      ai_timeline,
       ai_location
     } = req.body || {};
 
     if (!message || !user) {
-      return res.status(400).json({ ai_reply: 'Missing message or user' });
+      return res.status(400).json({ ai_reply: 'Missing message or user id.' });
     }
 
-    // ---- Mood detector (light heuristic) ----
-    const mood = detectMood(message);
+    // ---------- Helpers ----------
+    const mcSetField = async (fieldName, value) => {
+      if (!MANYCHAT_API_KEY) return;
+      if (value === undefined || value === null || value === '') return;
 
-    // Build known state & missing items list (drives the next best question)
-    const known = {
-      model: sanitize(ai_model),
-      budget: sanitize(ai_budget),
-      payment_mode: sanitize(ai_payment_mode),
-      timeline: sanitize(ai_timeline),
-      location: sanitize(ai_location),
+      try {
+        await fetch('https://api.manychat.com/fb/subscriber/setCustomField', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${MANYCHAT_API_KEY}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            subscriber_id: String(user),
+            field_name: fieldName,
+            field_value: value
+          })
+        });
+      } catch (e) {
+        console.warn('ManyChat setCustomField error', fieldName, e?.message);
+      }
     };
 
-    const missing = [];
-    if (!known.model) missing.push('model / klase ng sasakyan (e.g., sedan, SUV) o specific model');
-    if (!known.budget) missing.push('budget range (PHP)');
-    if (!known.payment_mode) missing.push('payment mode (cash o financing)');
-    if (!known.timeline) missing.push('timeline kung kailan bibili');
-    // location is helpful but optional — ask only if everything else is ready
-    const everythingElseReady =
-      known.model && known.budget && known.payment_mode && known.timeline;
-    if (!known.location && everythingElseReady) {
-      missing.push('location (optional, para sa availability at fees)');
-    }
+    // Normalize number from text, e.g., "600k", "₱600,000", "600 000"
+    const toNumber = (val) => {
+      if (val === undefined || val === null) return undefined;
+      if (typeof val === 'number') return val;
+      let s = String(val).toLowerCase().replace(/[₱, ]/g, '').trim();
+      if (s.endsWith('k')) s = String(parseFloat(s) * 1000);
+      const n = Number(s);
+      return Number.isFinite(n) ? Math.round(n) : undefined;
+    };
 
-    // Tone guide based on mood
-    const toneGuide = {
-      neutral: 'relaxed, friendly, conversational Taglish',
-      positive: 'upbeat, friendly, conversational Taglish',
-      confused: 'very clear and guiding Taglish, reassure kindly',
-      frustrated: 'calm, patient, and apologetic Taglish — keep it short and helpful',
-    }[mood];
+    // Build a compact snapshot of known state
+    const known = {
+      model: ai_model || '',
+      budget: ai_budget ?? '',
+      payment_mode: ai_payment_mode || '',
+      timeline: ai_timeline || '',
+      location: ai_location || ''
+    };
 
-    // System prompt
-    const system = `
-You are BentaCars' expert consultant. Be natural and human in Taglish (mix of Filipino + casual English).
-Auto-adjust tone to the user mood: ${toneGuide}.
-NEVER use the word "segment". Say "klase ng sasakyan" instead (e.g., sedan, SUV, MPV).
-Ask ONLY ONE short question at a time. Keep replies concise (1–2 lines).
+    // 1) Ask the model to EXTRACT *structured* fields from the latest user message.
+    const extractSystem = `
+You extract car-buying info from Filipino/Taglish messages.
+Return ONLY a single JSON object with any of these keys when confidently present:
+- "model": string (e.g., "Vios", "any sedan")
+- "budget_amount": number in PHP (e.g., 600000). Infer if user says "600k".
+- "payment_mode": "cash" or "financing"
+- "downpayment_amount": number in PHP (optional)
+- "monthly_amount": number in PHP (optional)
+- "timeline": short string (e.g., "this month", "1-2 months", "ASAP")
+- "location": short string (e.g., "Cebu City", "QC")
 
-Qualifying order before suggesting units:
-1) klase ng sasakyan or specific model
-2) budget range (PHP)
-3) payment mode (cash or financing). If "financing", you may ask DP or monthly range next.
-4) timeline (kailan bibili)
-5) location (optional, helpful)
+No commentary, no markdown. JSON only. If nothing found, return "{}".
+    `.trim();
 
-Rules:
-- If any of the above info is MISSING, DO NOT recommend cars yet — just ask the next best question.
-- If most info seems complete, briefly confirm and say you’ll check best options next (no unit names yet).
-- Avoid sounding robotic; talk like a helpful salesperson.
-- Never mention "target monthly" proactively. Ask DP or monthly only IF payment mode = financing.
-- If the user asks for availability or a model before qualification is complete, acknowledge and redirect with the next question.
-
-KNOWN STATE (from CRM):
-- Model/Klasse: ${known.model || '(wala pa)'}
-- Budget: ${known.budget || '(wala pa)'}
-- Payment Mode: ${known.payment_mode || '(wala pa)'}
-- Timeline: ${known.timeline || '(wala pa)'}
-- Location: ${known.location || '(wala pa)'}
-MISSING INFO: ${missing.length ? missing.join(', ') : 'none'}
-Return only plain text the customer will see (no JSON, no labels).
-`;
-
-    const userMsg = `${name ? name + ': ' : ''}${message}`.trim();
-
-    const completion = await fetch('https://api.openai.com/v1/chat/completions', {
+    const extractResp = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        temperature: 0.1,
+        messages: [
+          { role: 'system', content: extractSystem },
+          { role: 'user', content: message }
+        ]
+      })
+    });
+
+    const extractData = await extractResp.json();
+    let extracted = {};
+    try {
+      extracted = JSON.parse(
+        extractData?.choices?.[0]?.message?.content?.trim() || '{}'
+      );
+    } catch {
+      extracted = {};
+    }
+
+    // Coerce/clean extracted values
+    const upd = {
+      model: (extracted.model || '').toString().slice(0, 120),
+      budget: toNumber(extracted.budget_amount),
+      payment_mode: (extracted.payment_mode || '').toLowerCase() === 'financing'
+        ? 'financing'
+        : (extracted.payment_mode || '').toLowerCase() === 'cash'
+          ? 'cash'
+          : '',
+      timeline: (extracted.timeline || '').toString().slice(0, 120),
+      location: (extracted.location || '').toString().slice(0, 120)
+    };
+
+    // Only update fields that are new/changed
+    const updateOps = [];
+    if (upd.model && upd.model !== known.model) {
+      updateOps.push(mcSetField('ai_model', upd.model));
+      known.model = upd.model;
+    }
+    if (Number.isFinite(upd.budget) && upd.budget !== known.budget) {
+      updateOps.push(mcSetField('ai_budget', upd.budget));
+      known.budget = upd.budget;
+    }
+    if (upd.payment_mode && upd.payment_mode !== known.payment_mode) {
+      updateOps.push(mcSetField('ai_payment_mode', upd.payment_mode));
+      known.payment_mode = upd.payment_mode;
+    }
+    if (upd.timeline && upd.timeline !== known.timeline) {
+      updateOps.push(mcSetField('ai_timeline', upd.timeline));
+      known.timeline = upd.timeline;
+    }
+    if (upd.location && upd.location !== known.location) {
+      updateOps.push(mcSetField('ai_location', upd.location));
+      known.location = upd.location;
+    }
+    await Promise.allSettled(updateOps);
+
+    // 2) Generate the next human, Taglish reply (ONE question at a time).
+    //    Tone auto-adjusts to user message vibe.
+    const nextSystem = `
+You are BentaCars' car expert consultant. Respond in friendly, natural Taglish.
+Rules:
+- Sound human, casual, and helpful. No corporate/robot vibe.
+- Auto-adjust tone to the user's mood (polite if formal, lively if casual).
+- NEVER say "segment". Use plain words like "klase" o "type ng sasakyan".
+- Ask ONLY ONE specific, short follow-up question at a time.
+- Always keep it brief (1–2 short sentences max).
+- If enough info seems complete (model/type, budget, payment mode, timeline), confirm and say you'll check best options next.
+- Do NOT mention "target monthly".
+- If user asked something specific and info is insufficient, ask the *next best* question.
+
+Known info now (use to avoid asking again):
+- Model/Type: ${known.model || '(wala pa)'}
+- Budget: ${known.budget || '(wala pa)'}
+- Payment mode: ${known.payment_mode || '(wala pa)'}
+- Timeline: ${known.timeline || '(wala pa)'}
+- Location: ${known.location || '(wala pa)'}
+    `.trim();
+
+    // Decide the next best question
+    const needs = [];
+    if (!known.model) needs.push('model/type');
+    if (!known.budget) needs.push('budget');
+    if (!known.payment_mode) needs.push('payment mode (cash or financing)');
+    if (!known.timeline) needs.push('timeline');
+
+    let userMsg = `${name ? name + ': ' : ''}${message}`.trim();
+
+    const nextResp = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json'
       },
       body: JSON.stringify({
         model: 'gpt-4o-mini',
         temperature: 0.3,
         messages: [
-          { role: 'system', content: system },
-          { role: 'user', content: userMsg },
-        ],
-      }),
+          { role: 'system', content: nextSystem },
+          {
+            role: 'user',
+            content:
+              needs.length === 0
+                ? `${userMsg}\n\nIf info looks complete, confirm briefly and say you'll check best 2 options next.`
+                : `${userMsg}\n\nWe still need: ${needs.join(', ')}. Ask only the next best one.`
+          }
+        ]
+      })
     });
 
-    const data = await completion.json();
-
-    // Basic guardrails
-    const raw = data?.choices?.[0]?.message?.content?.trim();
+    const nextData = await nextResp.json();
     const aiText =
-      cleanText(raw) ||
-      fallbackNextQuestion(known, missing, name);
+      nextData?.choices?.[0]?.message?.content?.trim() ||
+      'Sige! Ano pong budget range natin para makahanap ako ng magandang match?';
 
     return res.status(200).json({ ai_reply: aiText });
   } catch (err) {
-    console.error('chat error:', err);
+    console.error('API error', err);
     return res.status(500).json({
-      ai_reply:
-        'Sorry, nagka-issue saglit. Paki-type ulit po ang message at tutulungan ko kayo agad. 🙏',
+      ai_reply: 'Sorry! Nagka-issue saglit. Paki-type ulit po ang message 😊'
     });
   }
-}
-
-/* ----------------- Helpers ----------------- */
-
-function sanitize(v) {
-  if (v == null) return '';
-  const s = String(v).trim();
-  // Treat "0" as empty for budget if it came as number-like zero accidentally
-  if (!s) return '';
-  return s;
-}
-
-function cleanText(s) {
-  if (!s) return '';
-  // Strip any stray code fences or JSON artifacts just in case
-  return s.replace(/```[\s\S]*?```/g, '').trim();
-}
-
-function detectMood(text) {
-  const t = (text || '').toLowerCase();
-
-  // quick signals
-  const frustratedWords = ['ang tagal', 'bagal', 'bwisit', 'badtrip', 'hassle', 'ano ba', 'di ko maintindihan', 'nakakainis'];
-  const confusedWords = ['paano', 'hindi ko alam', 'di ko sure', 'ano ibig sabihin', 'paki explain'];
-  const positiveWords = ['thank', 'thanks', 'ayos', 'great', 'sige', 'nice', 'ok na', 'salamat', 'galing'];
-
-  if (frustratedWords.some(w => t.includes(w))) return 'frustrated';
-  if (confusedWords.some(w => t.includes(w))) return 'confused';
-  if (positiveWords.some(w => t.includes(w)) || /😊|🙂|👍|👌/.test(t)) return 'positive';
-  return 'neutral';
-}
-
-function fallbackNextQuestion(known, missing, name) {
-  const firstName = (name || '').trim() ? `${name.split(' ')[0]}` : '';
-  const hi = firstName ? `${firstName},` : '';
-
-  // Decide next best question if model failed
-  if (!known.model) {
-    return `Hi ${hi ? hi + ' ' : ''}👋 Anong **klase ng sasakyan** ang hanap mo (e.g., sedan, SUV) — o may specific model ka na in mind?`;
-  }
-  if (!known.budget) {
-    return `Got it! Para ma-match ko nang tama, about **magkano pong budget range** natin (PHP)?`;
-  }
-  if (!known.payment_mode) {
-    return `Noted. **Cash o financing** po plan ninyo? (Kung financing, pwede ninyo din ilagay ballpark DP or monthly.)`;
-  }
-  if (!known.timeline) {
-    return `Sige! **Kailan ninyo balak bumili** — this month, within 1–3 months, or later?`;
-  }
-  if (!known.location) {
-    return `Copy. Optional lang, pero saan po **location** ninyo? Makakatulong para sa availability at fees.`;
-  }
-  return `Thanks! I’ll check the best options for you now based on details na binigay ninyo. 👌`;
 }
