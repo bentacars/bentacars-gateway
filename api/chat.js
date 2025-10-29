@@ -1,4 +1,8 @@
 // /api/chat.js
+// Fast, deterministic qualifier (instant replies).
+// Uses OpenAI only as a fallback when still ambiguous.
+// ManyChat: map $.ai_reply -> ai_reply
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ ai_reply: 'Method not allowed' });
@@ -16,49 +20,80 @@ export default async function handler(req, res) {
       ai_location = ''
     } = req.body || {};
 
-    // Light model → body-type inference so the question doesn’t feel awkward
-    const modelToBody = {
-      // Toyota
-      vios: 'sedan',
-      wigo: 'hatchback',
-      raize: 'crossover',
-      innova: 'mpv',
-      avanza: 'mpv',
-      veloz: 'mpv',
-      fortuner: 'suv',
-      hilux: 'pickup',
-      // Honda
-      city: 'sedan',
-      civic: 'sedan',
-      brv: '7-seater suv',
-      // Nissan
-      almera: 'sedan',
-      // Mitsubishi
-      xpander: 'mpv',
-      mirage: 'hatchback',
-      // Ford
-      territory: 'suv',
-    };
+    // --- Normalize incoming text
+    const raw = String(message || '').trim();
+    const msg = raw.toLowerCase();
 
-    const normalizedModel = String(ai_model || '').toLowerCase().replace(/\s+/g, '');
+    // --- Light model → body-type inference
+    const modelToBody = {
+      vios: 'sedan', wigo: 'hatchback', raize: 'crossover',
+      innova: 'mpv', avanza: 'mpv', veloz: 'mpv', fortuner: 'suv', hilux: 'pickup',
+      city: 'sedan', civic: 'sedan', brv: '7-seater suv',
+      almera: 'sedan', xpander: 'mpv', mirage: 'hatchback',
+      territory: 'suv'
+    };
+    const normModel = String(ai_model || '').toLowerCase().replace(/\s+/g, '');
     let inferredBody = '';
-    for (const key of Object.keys(modelToBody)) {
-      if (normalizedModel.includes(key)) {
-        inferredBody = modelToBody[key];
+    for (const k of Object.keys(modelToBody)) {
+      if (normModel.includes(k) || msg.includes(k)) {
+        inferredBody = modelToBody[k];
         break;
       }
     }
 
-    // Figure out what’s already known / missing
+    // --- Heuristics from the last user message
+    const paymentFromMsg =
+      /cash\b/.test(msg) ? 'cash' :
+      /(finance|loan|installment|hulugan|monthly)/.test(msg) ? 'financing' :
+      '';
+
+    // extract money-like number (₱, k, etc.)
+    const moneyMatch = msg.match(/(?:₱|\bphp\s*)?([\d,.]+)\s*(k|thou|thousand)?/i);
+    let moneyValue = '';
+    if (moneyMatch) {
+      const base = parseFloat((moneyMatch[1] || '').replace(/,/g, ''));
+      if (!isNaN(base)) {
+        moneyValue = moneyMatch[2] ? String(Math.round(base * 1000)) : String(Math.round(base));
+      }
+    }
+
+    // timeline inference
+    let timelineFromMsg = '';
+    if (/(today|tonight|ngayon)/.test(msg)) timelineFromMsg = 'today';
+    else if (/(this week|within the week|week)/.test(msg)) timelineFromMsg = 'this week';
+    else if (/(next week)/.test(msg)) timelineFromMsg = 'next week';
+    else if (/(this month|within the month)/.test(msg)) timelineFromMsg = 'this month';
+    else if (/(next month)/.test(msg)) timelineFromMsg = 'next month';
+
+    // location – very light (we keep whatever user already provided)
+    const locationFromMsg = ''; // optional: try to parse cities/barangays if you want later
+
+    // --- Known fields after merging heuristics
     const known = {
-      model_or_body: (ai_model && ai_model.trim()) || inferredBody, // treat inferred body as progress
-      payment_mode: ai_payment_mode, // 'cash' or 'financing' ideally
-      budget_or_dp: ai_budget,       // cash budget OR downpayment on-hand
-      timeline: ai_timeline,
-      location: ai_location
+      model_or_body:
+        (ai_model && ai_model.trim()) ||
+        inferredBody ||
+        '',
+
+      payment_mode: (ai_payment_mode || paymentFromMsg || '').toLowerCase(),
+
+      budget_or_dp: (ai_budget || moneyValue || '').toString(),
+
+      timeline: (ai_timeline || timelineFromMsg || '').toString(),
+
+      location: (ai_location || locationFromMsg || '').toString()
     };
 
-    // Choose the next best missing item, in our agreed order.
+    // Greeting fast-path (instant, no OpenAI)
+    if (/^(hi|hello|hey|yo|good\s*(am|pm|day)|hi po|hello po)\b/.test(msg)) {
+      return res.status(200).json({
+        ai_reply: `Hi ${name || ''}! 👋 Anong model ang tinitingnan mo? 
+Kung wala pa, 5-seater (sedan/hatch/crossover) ba or 7-seater+ (MPV/SUV/van)? Pwede rin pickup o pang-negosyo.`
+          .replace(/\s+/g, ' ')
+      });
+    }
+
+    // Decide next missing info (our agreed order)
     const missingOrder = [];
     if (!known.model_or_body) missingOrder.push('model_or_body');
     if (!known.payment_mode)  missingOrder.push('payment_mode');
@@ -66,89 +101,45 @@ export default async function handler(req, res) {
     if (!known.location)      missingOrder.push('location');
     if (!known.timeline)      missingOrder.push('timeline');
 
-    // Build a compact context string to guide the model
-    const contextSummary = `
-Known so far:
-- Model/Body: ${known.model_or_body || '(none)'}
-- Payment mode: ${known.payment_mode || '(none)'}
-- Budget/DP: ${known.budget_or_dp || '(none)'}
-- Location: ${known.location || '(none)'}
-- Timeline: ${known.timeline || '(none)'}
-Missing (in order): ${missingOrder.length ? missingOrder.join(', ') : 'none'}.
-`.trim();
+    // Ask ONE concise question depending on the next missing item
+    if (missingOrder.length) {
+      const next = missingOrder[0];
 
-    // Human-friendly, Taglish, non-robotic system guide
-    const system = `
-Ikaw ay sales assistant ng BentaCars. Goals:
-1) Mag-qualify muna bago mag-offer.
-2) Taglish, natural, at sumasabay sa tono ng kausap (if casual → casual; if formal → medyo formal).
-3) Huwag gumamit ng salitang "segment". 
-4) Isang maikling tanong lang bawat reply, very conversational.
+      let prompt = '';
+      if (next === 'model_or_body') {
+        prompt =
+          `Got it! Anong model ang target mo? ` +
+          `Kung undecided pa, 5-seater (sedan/hatch/crossover) ba or 7-seater+ (MPV/SUV/van)? ` +
+          `Pwede rin pickup o pang-negosyo.`;
+      } else if (next === 'payment_mode') {
+        prompt = `Sige. Payment mo ba ay **cash** o **financing**?`;
+      } else if (next === 'budget_or_dp') {
+        prompt = known.payment_mode === 'cash'
+          ? `Mga magkano ang cash budget mo?`
+          : `Magkano ang on-hand na downpayment mo (approx ok)?`;
+      } else if (next === 'location') {
+        prompt = `Saan area ka located para makahanap tayo ng malapit sa’yo?`;
+      } else if (next === 'timeline') {
+        prompt = `Kung may ma-suggest akong swak today, makakapag-view ka ba **this week**?`;
+      }
 
-FLOW NG TANONG (isa-isa):
-A. Unahin alamin ang kailangan ng customer:
-   - Kung may binanggit na model (hal. "Vios"), puwedeng i-infer ang body (sedan, hatchback, crossover, MPV/SUV, pickup, van, pang-negosyo FB).
-   - Kung wala, i-clarify: “5-seater (sedan/hatch/crossover) ba o 7-seater+ (MPV/SUV/van)? Or pickup/pang-negosyo?”
-   - Optional kasunod: transmission (automatic/manual/anything).
-B. Payment mode:
-   - “Cash o financing?”
-C. Budget details:
-   - Kung CASH: “Mga magkano cash budget mo?”
-   - Kung FINANCING: “Magkano ang on-hand na downpayment mo?” (huwag magtanong ng target monthly)
-D. Location (maaga pa lang kung wala pa): “Saan area ka para makahanap tayong malapit sa’yo?”
-E. Timeline (urgent framing):
-   - “Kung may ma-suggest ako na swak today, makakapag-view ka ba this week?”
+      return res.status(200).json({ ai_reply: prompt });
+    }
 
-KAPAG KULANG PA ANG INFO:
-- Huwag muna mag-offer.
-- Magtanong ng susunod na pinaka-makabuluhang tanong (ayon sa order sa itaas).
-- Maging maikli at friendly.
+    // If we reach here, kompleto na ang key qualifiers → acknowledge (no unit list yet)
+    const doneMsg =
+      `Thanks ${name || ''}! Parang kumpleto na tayo. ` +
+      `Iche-check ko ngayon ang best **2 options** na bagay sa'yo.`;
+    return res.status(200).json({ ai_reply: doneMsg });
 
-KAPAG KUMPLETO NA ANG MAHALAGANG INFO (model/body, payment mode, budget/DP, timeline, location):
-- Huwag pa rin maglista ng units.
-- Sabihin lang na iche-check mo ang best 2 options para sa kanya at kasunod na mensahe ay ang mga options.
+    // --- Optional: If you still want to keep OpenAI as fallback when ambiguous,
+    // move the return above into an `else` and keep the call below.
+    // For now we short-circuit to keep replies instant.
 
-Output: plain text lang na isasend sa customer. Walang JSON, walang code block.
-`.trim();
-
-    // Compose the user message with mood-aware hinting
-    const userMsg = `
-Customer: ${name || 'Customer'} (${user})
-Latest message: "${message}"
-${contextSummary}
-
-Gawin mong very natural at maiksi. Tanong ka lang ng isa, maliban na lang kung simple confirmation.
-`.trim();
-
-    // Call OpenAI (chat completions). Model = gpt-4o-mini as agreed.
-    const completion = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: 'gpt-4o-mini',
-        temperature: 0.3,
-        messages: [
-          { role: 'system', content: system },
-          { role: 'user', content: userMsg }
-        ]
-      })
-    });
-
-    const data = await completion.json();
-
-    // Fallback, just in case
-    const aiText =
-      data?.choices?.[0]?.message?.content?.trim() ||
-      'Sige! Para masakto ko, anong klase ng sasakyan ang hanap mo—5-seater (sedan/hatch/crossover) ba o 7-seater+ (MPV/SUV/van)?';
-
-    return res.status(200).json({ ai_reply: aiText });
   } catch (err) {
     console.error(err);
     return res.status(500).json({
-      ai_reply: 'Oops, nagka-issue saglit. Paki-type ulit po, ayusin ko kaagad.'
+      ai_reply: 'Oops, nagka-issue saglit. Paki-type ulit po, aayusin ko agad.'
     });
   }
 }
