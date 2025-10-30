@@ -1,5 +1,4 @@
-// /api/chat.js
-// ✅ Stable version: P1-qualifier-2025-10-30-03 (Vercel JavaScript)
+// /api/chat.js  (Vercel JavaScript, stable)
 module.exports = async (req, res) => {
   const VERSION = 'P1-qualifier-2025-10-30-03';
   if (req.method !== 'POST') {
@@ -8,11 +7,9 @@ module.exports = async (req, res) => {
 
   const isDebug = String(req.query.debug || '').toLowerCase() === '1';
 
-  // --- Helpers ---
   const S = (v) => (v == null ? '' : String(v));
   const isPlaceholder = (s) =>
-    !!s &&
-    (/^\s*\{\{[^}]+\}\}\s*$/.test(s) || /^\s*(null|undefined|-+)\s*$/i.test(s));
+    !!s && (/^\s*\{\{[^}]+\}\}\s*$/.test(s) || /^\s*(null|undefined|-+)\s*$/i.test(s));
   const clean = (v) => {
     const s = S(v).trim();
     if (!s || isPlaceholder(s)) return '';
@@ -55,7 +52,6 @@ module.exports = async (req, res) => {
   const addDebug = (base, obj) =>
     isDebug ? `${base}\n[v:${VERSION} ${Object.entries(obj).map(([k,v])=>`${k}=${v||'-'}`).join(', ')}]` : base;
 
-  // --- Input ---
   const b = req.body || {};
   const message = clean(b.message);
   const name = clean(b.name);
@@ -67,14 +63,12 @@ module.exports = async (req, res) => {
 
   const msgNorm = norm(message);
 
-  // Reset
   if (/\b(reset|change unit|baguhin)\b/i.test(message)) {
     return res.status(200).json({
       ai_reply: 'Got it! Let’s start fresh 👍 Anong model o 5-seater/7-seater ang hanap mo? (Pwede rin pickup o pang-negosyo)'
     });
   }
 
-  // Inference
   if (!ai_model) {
     for (const key of Object.keys(MODEL_TO_BODY)) {
       if (msgNorm.includes(key)) ai_model = key;
@@ -86,7 +80,6 @@ module.exports = async (req, res) => {
     if (amt > 0) ai_budget = `${amt}`;
   }
 
-  // Known state
   let inferredBody = '';
   for (const key of Object.keys(MODEL_TO_BODY)) {
     if (norm(ai_model).includes(key)) inferredBody = MODEL_TO_BODY[key];
