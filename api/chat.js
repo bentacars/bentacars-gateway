@@ -1,162 +1,210 @@
-// /api/chat.js — Phase 1 deterministic qualifier (no LLM)
-// Hard-stop against premature "complete". Includes version + debug snapshot.
-
-const VERSION = 'P1-qualifier-2025-10-30-01';
+// /api/chat.ts (or chat.js)
+// Full P1 Qualifier – ManyChat safe, deterministic.
+// v: P1-qualifier-2025-10-30-03
 
 export default async function handler(req, res) {
+  const VERSION = 'P1-qualifier-2025-10-30-03';
   if (req.method !== 'POST') {
-    return res.status(405).json({ ai_reply: 'Method not allowed', version: VERSION });
+    return res.status(200).json({ ai_reply: 'Method not allowed', version: VERSION });
   }
 
-  try {
-    // -------- 1) Inputs --------
-    const {
-      message = '',
-      user = '',
-      name = '',
-      ai_model = '',
-      ai_budget = '',
-      ai_payment_mode = '',
-      ai_timeline = '',
-      ai_location = ''
-    } = (req.body || {});
+  const isDebug = String(req.query.debug || '').toLowerCase() === '1';
 
-    const clean = (v) => {
-      if (v === null || v === undefined) return '';
-      const s = String(v).trim();
-      const lower = s.toLowerCase();
-      if (!s || ['not set', 'n/a', 'none', 'null', 'undefined', '-', '(none)'].includes(lower)) return '';
-      return s;
-    };
+  // --------- Helpers ----------
+  const S = (v: any) => (v == null ? '' : String(v));
+  const isPlaceholder = (s: string) =>
+    !!s &&
+    (
+      /^\s*\{\{[^}]+\}\}\s*$/.test(s) ||           // {{cuf_xxx}}
+      /^\s*(null|undefined|-+)\s*$/i.test(s)
+    );
+  const clean = (v: any) => {
+    const s = S(v).trim();
+    if (!s || isPlaceholder(s)) return '';
+    return s;
+  };
+  const norm = (v: any) => clean(v).toLowerCase().replace(/\s+/g, ' ').trim();
 
-    const msgRaw = clean(message);
-    const msg = msgRaw.toLowerCase();
-    const firstName = clean(name) || 'there';
+  // Currency/amount normalizer (returns number in PHP if found, else 0)
+  const parseAmount = (txt: string): number => {
+    const s = txt
+      .replace(/[₱,]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+    // common “200k”, “150k”, “1.2m”
+    const km = s.match(/(\d+(?:\.\d+)?)\s*k\b/);
+    if (km) return Math.round(parseFloat(km[1]) * 1000);
+    const mm = s.match(/(\d+(?:\.\d+)?)\s*m\b/);
+    if (mm) return Math.round(parseFloat(mm[1]) * 1_000_000);
+    const plain = s.match(/\b\d{2,9}\b/);
+    if (plain) return parseInt(plain[0], 10);
+    return 0;
+  };
 
-    // -------- 2) Inference helpers --------
-    const modelToBody = {
-      vios: 'sedan', wigo: 'hatchback', raize: 'crossover',
-      innova: 'mpv', avanza: 'mpv', veloz: 'mpv',
-      fortuner: 'suv', hilux: 'pickup',
-      city: 'sedan', civic: 'sedan', brv: '7-seater suv',
-      almera: 'sedan',
-      xpander: 'mpv', mirage: 'hatchback',
-      territory: 'suv'
-    };
+  // Body/model inference
+  const MODEL_TO_BODY: Record<string, string> = {
+    // Toyota
+    vios: 'sedan', wigo: 'hatchback', raize: 'crossover', yaris: 'hatchback',
+    innova: 'mpv', avanza: 'mpv', veloz: 'mpv', fortuner: 'suv', hilux: 'pickup',
+    rush: 'suv', altis: 'sedan',
+    // Honda
+    city: 'sedan', civic: 'sedan', brv: '7-seater suv', hrv: 'crossover', crv: 'suv', brio: 'hatchback',
+    // Nissan
+    almera: 'sedan', terra: 'suv', navara: 'pickup', livina: 'mpv',
+    // Mitsubishi
+    xpander: 'mpv', mirage: 'hatchback', montero: 'suv', strada: 'pickup',
+    // Ford
+    territory: 'suv', everest: 'suv', ranger: 'pickup',
+    // Suzuki
+    ertiga: 'mpv', swift: 'hatchback', dzire: 'sedan', jimny: 'suv',
+    // Hyundai / Kia / Isuzu (common)
+    stargazer: 'mpv', staria: 'van', accent: 'sedan',
+    soluto: 'sedan', sportage: 'suv', sorento: 'suv', carnival: 'van',
+    mux: 'suv', dmax: 'pickup'
+  };
 
-    const includesAny = (t, arr) => arr.some(k => t.includes(k));
+  const looksLikeBody = (msg: string) => {
+    const m = msg.toLowerCase();
+    if (/sedan|hatch|hatchback|crossover|mpv|suv|van|pickup|fb/.test(m)) return true;
+    if (/\b5\s*seater|\bfive[- ]?seater\b/.test(m)) return true;
+    if (/\b7\s*seater|\bseven[- ]?seater|7[- ]?seater\+?/.test(m)) return true;
+    return false;
+  };
 
-    const inferBodyFromMsg = () => {
-      if (includesAny(msg, ['sedan'])) return 'sedan';
-      if (includesAny(msg, ['hatchback', 'hatch'])) return 'hatchback';
-      if (includesAny(msg, ['crossover'])) return 'crossover';
-      if (includesAny(msg, ['mpv'])) return 'mpv';
-      if (includesAny(msg, ['suv'])) return 'suv';
-      if (includesAny(msg, ['pickup', 'pick up'])) return 'pickup';
-      if (includesAny(msg, ['van'])) return 'van';
-      if (includesAny(msg, ['7-seater', '7 seater', 'seven seater'])) return '7-seater';
-      if (includesAny(msg, ['5-seater', '5 seater', 'five seater'])) return '5-seater';
-      for (const key of Object.keys(modelToBody)) if (msg.includes(key)) return modelToBody[key];
-      return '';
-    };
+  // Payment parsing
+  const parsePaymentMode = (txt: string): 'cash' | 'financing' | '' => {
+    const t = norm(txt);
+    if (!t) return '';
+    if (/\bcash\b|spot cash|full cash|lumpsum/.test(t)) return 'cash';
+    if (/\bfinanc|installment|loan|all[-\s]?in|bank|po\s?financing/.test(t)) return 'financing';
+    return '';
+  };
 
-    const inferPaymentFromMsg = () => {
-      if (/(^|\b)(cash|full payment)(\b|$)/.test(msg)) return 'cash';
-      if (/(financing|loan|installment|hulugan|monthly|terms)/.test(msg)) return 'financing';
-      return '';
-    };
+  // Transmission parsing (optional only)
+  const parseTransmission = (txt: string): 'automatic' | 'manual' | '' => {
+    const t = norm(txt);
+    if (!t) return '';
+    if (/\bauto|at|automatic/.test(t)) return 'automatic';
+    if (/\bmanual|mt/.test(t)) return 'manual';
+    return '';
+  };
 
-    const inferBudgetOrDPFromMsg = () => {
-      const m = msg.match(/(\d[\d,\.]*)\s*(k|thou|thousand)?/i);
-      if (!m) return '';
-      let n = m[1].replace(/[,\.]/g, '');
-      if (!n) return '';
-      let val = parseInt(n, 10);
-      if (isNaN(val)) return '';
-      if (m[2]) val *= 1000;
-      return String(val);
-    };
+  // Debug footer toggle
+  const addDebug = (base: string, obj: any) =>
+    isDebug ? `${base}\n[v:${VERSION} ${Object.entries(obj).map(([k,v])=>`${k}=${v||'-'}`).join(', ')}]` : base;
 
-    const inferTimelineFromMsg = () => {
-      if (/(today|ngayon)\b/.test(msg)) return 'today';
-      if (/(this week|within the week|week)/.test(msg)) return 'this week';
-      if (/(next week)/.test(msg)) return 'next week';
-      if (/(this month|within the month)/.test(msg)) return 'this month';
-      if (/(next month)/.test(msg)) return 'next month';
-      if (/(soon|agad|asap)/.test(msg)) return 'soon';
-      return '';
-    };
+  // --------- Input from ManyChat ----------
+  const b = req.body || {};
+  const message     = clean(b.message);
+  const user        = clean(b.user);
+  const name        = clean(b.name);
 
-    const resetWanted = /\b(reset|restart|start\s*again|change unit|palit unit|bagong simula)\b/i.test(msg);
+  // Custom fields (may arrive as {{cuf_xxx}})
+  let ai_model      = clean(b.ai_model);
+  let ai_budget     = clean(b.ai_budget);
+  let ai_payment    = clean(b.ai_payment_mode);
+  let ai_timeline   = clean(b.ai_timeline);
+  let ai_location   = clean(b.ai_location);
 
-    // -------- 3) Merge "known" state --------
-    const known = {
-      model_or_body: clean(ai_model) || inferBodyFromMsg(),
-      payment_mode : clean(ai_payment_mode) || inferPaymentFromMsg(),
-      budget_or_dp : clean(ai_budget) || inferBudgetOrDPFromMsg(),
-      location     : clean(ai_location),
-      timeline     : clean(ai_timeline) || inferTimelineFromMsg()
-    };
+  const msgNorm = norm(message);
 
-    const isFilled = (s) => !!(s && String(s).trim());
-
-    // Strict completion: ALL must be present (no inference-only completion!)
-    const allComplete =
-      isFilled(clean(ai_model)) || isFilled(known.model_or_body) ? // model/body can be inferred OR typed
-      ( isFilled(known.payment_mode) &&
-        isFilled(known.budget_or_dp) &&
-        isFilled(known.location) &&
-        isFilled(known.timeline) &&
-        isFilled(known.model_or_body) ) : false;
-
-    // -------- 4) Compose next reply deterministically --------
-    let ai_reply = '';
-
-    if (resetWanted) {
-      ai_reply = `Got it! Let’s start fresh 👍 Anong model o 5-seater/7-seater ang hanap mo? (Pwede rin pickup o pang-negosyo)`;
-    } else if (/^(hi|hello|hey|yo|good\s*(am|pm|day)|hi po|hello po)\b/i.test(msg)) {
-      ai_reply = `Hi ${firstName}! 👋 Para masakto ko, anong model ang target mo? Kung undecided pa: 5-seater (sedan/hatch/crossover) ba o 7-seater+ (MPV/SUV/van)? Pwede rin pickup o pang-negosyo.`;
-    } else if (!isFilled(known.model_or_body)) {
-      ai_reply = `Sige! Para masakto, 5-seater (sedan/hatch/crossover) ba o 7-seater+ (MPV/SUV/van)? Pwede rin pickup o pang-negosyo.`;
-    } else if (!isFilled(known.payment_mode)) {
-      const hinted = inferPaymentFromMsg();
-      if (hinted === 'cash') ai_reply = `Mukhang cash ang gusto mo—tama ba?`;
-      else if (hinted === 'financing') ai_reply = `Mukhang financing ang plan mo—tama ba?`;
-      else ai_reply = `Payment plan natin—**cash** o **financing**?`;
-    } else if (!isFilled(known.budget_or_dp)) {
-      ai_reply = known.payment_mode === 'cash'
-        ? `Mga magkano ang cash budget mo? Ballpark ok lang.`
-        : `Magkano ang on-hand na **downpayment** mo ngayon? Ballpark ok lang.`;
-    } else if (!isFilled(known.location)) {
-      ai_reply = `Saan area ka located para ma-match ko sa pinakamalapit na unit? (Hal. QC, Makati, Cavite, Cebu)`;
-    } else if (!isFilled(known.timeline)) {
-      ai_reply = `Kung may ma-suggest akong swak **today**, makakapag-view ka ba **this week**?`;
-    } else if (allComplete) {
-      ai_reply = `Thanks ${firstName}! ✅ Kumpleto na tayo. Iche-check ko ngayon ang **best 2 options** na bagay sa’yo.`;
-    } else {
-      // safety fallback
-      ai_reply = `Sige! Para masakto ko, 5-seater (sedan/hatch/crossover) ba o 7-seater+ (MPV/SUV/van)?`;
-    }
-
-    // -------- 5) Optional debug (append or as separate field) --------
-    const debug = String(req.query.debug || '') === '1';
-    const ai_state = {
-      version: VERSION,
-      received: { message, user, name, ai_model, ai_budget, ai_payment_mode, ai_timeline, ai_location },
-      known,
-      allComplete
-    };
-
-    if (debug) {
-      // Append a short snapshot so you can see what the server thinks (remove later)
-      const brief = `\n[v:${VERSION} | known:${Object.entries(known).map(([k,v])=>`${k}=${v||'-'}`).join(', ')} | complete=${allComplete}]`;
-      return res.status(200).json({ ai_reply: ai_reply + brief, ai_state });
-    }
-
-    return res.status(200).json({ ai_reply, version: VERSION });
-
-  } catch (err) {
-    console.error('[api/chat] error:', err);
-    return res.status(500).json({ ai_reply: 'Oops, nagka-issue saglit. Paki-type ulit po, aayusin ko kaagad.', version: VERSION });
+  // 1) Reset / change intent
+  if (/\b(reset|baguhin|change\s*(unit|model)?)\b/i.test(message)) {
+    const resetLine = `Got it! Let’s start fresh 👍 Anong model o 5-seater/7-seater ang hanap mo? (Pwede rin pickup o pang-negosyo)`;
+    return res.status(200).json({
+      ai_reply: addDebug(resetLine, { step: 'reset', user })
+    });
   }
+
+  // 2) Try to infer missing bits from the **latest message**
+  // 2a) Model/body
+  if (!ai_model) {
+    // If message names a model (e.g., "Vios"), store it as ai_model
+    for (const key of Object.keys(MODEL_TO_BODY)) {
+      if (msgNorm.includes(key)) { ai_model = key; break; }
+    }
+    // If not model but body words (sedan/5 seater etc.), keep as body only
+  }
+  // 2b) Payment mode
+  if (!ai_payment) {
+    const p = parsePaymentMode(message);
+    if (p) ai_payment = p;
+  }
+  // 2c) Budget/DP quick catch from message
+  if (!ai_budget) {
+    if (/all[-\s]?in|dp|down\s*payment|downpayment/.test(msgNorm) || parsePaymentMode(msgNorm)==='financing') {
+      const amt = parseAmount(message);
+      if (amt > 0) ai_budget = `${amt}`;
+    } else if (parsePaymentMode(msgNorm)==='cash' || /cash|budget|presyo|price/.test(msgNorm)) {
+      const amt = parseAmount(message);
+      if (amt > 0) ai_budget = `${amt}`;
+    }
+  }
+  // 2d) Transmission (optional; not part of completion)
+  const transmission = parseTransmission(message); // for follow-up warmth; not used in completion gate
+
+  // 3) Build known state
+  const normalizedModel = norm(ai_model);
+  let inferredBody = '';
+  for (const key of Object.keys(MODEL_TO_BODY)) {
+    if (normalizedModel.includes(key)) { inferredBody = MODEL_TO_BODY[key]; break; }
+  }
+
+  let msgBody = '';
+  if (looksLikeBody(message)) {
+    if (/\b5\s*seater|\bfive[- ]?seater\b/.test(msgNorm)) msgBody = '5-seater (sedan/hatch/crossover)';
+    else if (/\b7\s*seater|\bseven[- ]?seater|7[- ]?seater\+?/.test(msgNorm)) msgBody = '7-seater+ (MPV/SUV/van)';
+    else if (/sedan|hatch|hatchback|crossover|mpv|suv|van|pickup|fb/.test(msgNorm)) msgBody = message.trim();
+  }
+
+  const known = {
+    model_or_body: clean(ai_model) || inferredBody || msgBody,
+    payment_mode:  norm(ai_payment),        // 'cash' | 'financing' | ''
+    budget_or_dp:  clean(ai_budget),
+    location:      clean(ai_location),
+    timeline:      clean(ai_timeline),
+  };
+
+  // 4) Decide the next best question (AAL – one question only)
+  const askBody = `Anong hanap mo—5-seater (sedan/hatch/crossover) ba o 7-seater+ (MPV/SUV/van)? Pwede rin pickup o pang-negosyo (FB).`;
+  const askPay  = `Sige! Cash o financing ang plan mo?`;
+  const askCash = `Copy. Mga magkano ang **cash budget** mo?`;
+  const askDP   = `Copy. Magkano ang **on-hand na downpayment** mo ngayon? (range ok)`;
+  const askLoc  = `Saan area ka para makahanap tayong malapit sa’yo?`;
+  const askTime = `Kung may ma-suggest ako na swak **today**, makakapag-view ka ba **this week**?`;
+
+  let reply = '';
+
+  if (!known.model_or_body) {
+    reply = `Noted. ${askBody}`;
+  } else if (!known.payment_mode) {
+    // small warmth if we caught transmission
+    reply = transmission
+      ? `Noted—${transmission} ka. ${askPay}`
+      : askPay;
+  } else if (!known.budget_or_dp) {
+    reply = known.payment_mode === 'cash' ? askCash : askDP;
+  } else if (!known.location) {
+    reply = askLoc;
+  } else if (!known.timeline) {
+    reply = askTime;
+  } else {
+    reply = `Thanks ${name || 'po'}! ✅ Kumpleto na tayo. Iche-check ko ngayon ang **best 2 options** na bagay sa’yo.`;
+  }
+
+  const debugObj = {
+    user,
+    model_or_body: known.model_or_body,
+    pay: known.payment_mode,
+    budget: known.budget_or_dp,
+    loc: known.location,
+    time: known.timeline,
+    trans: transmission || '',
+    complete: (!(!known.model_or_body || !known.payment_mode || !known.budget_or_dp || !known.location || !known.timeline)).toString()
+  };
+
+  return res.status(200).json({
+    ai_reply: addDebug(reply, debugObj)
+  });
 }
